@@ -1,0 +1,257 @@
+blueprint:
+  name: Random Pet Feeder Schedule (Aqara C1 / Zigbee2MQTT)
+  description: >-
+    Generates a fresh, unpredictable feeding schedule every day and pushes it to
+    the onboard memory of an Aqara Smart pet feeder C1 (ZNCWWSQ01LM) via
+    Zigbee2MQTT over MQTT. Because the schedule lives on the device itself, a
+    Home Assistant crash or outage cannot disrupt feeding.
+
+    Each day, 5 minutes after the configured window_end, the automation splits
+    the window into `num_feeds` equal periods and picks one random minute in
+    each — strictly inside (window_start, window_end) — enforcing min_gap (and
+    max_gap when > 0; the gap limits win if they conflict with a period), then
+    publishes the result to
+    zigbee2mqtt/<device name>/set. It then waits up to 60 s for the device's
+    schedule sensor to change as confirmation; if that does not happen it raises
+    a persistent notification warning that the feeder may still be running on
+    the previous day's schedule.
+
+    IMPORTANT: the MQTT topic is derived from the device's Home Assistant name,
+    which must match its Zigbee2MQTT friendly name (true by default). Do not
+    rename the feeder in Settings > Devices > & Services unless you also rename
+    it in Zigbee2MQTT, or the publish will go to a non-existent topic.
+  domain: automation
+  source_url: https://github.com/example/blueprints/raw/main/automation/random_feeder_schedule.yaml
+  input:
+    feeder_device:
+      name: Feeder device
+      description: >-
+        The Aqara Smart pet feeder C1 (ZNCWWSQ01LM). Zigbee2MQTT devices enter
+        Home Assistant through MQTT Discovery, so the owning integration is
+        "mqtt" and the filter below lists all MQTT-discovered devices — pick
+        your feeder from the list.
+      selector:
+        device:
+          filter:
+            - integration: mqtt
+    schedule_sensor:
+      name: Schedule state sensor
+      description: >-
+        The Zigbee2MQTT sensor that mirrors the device's onboard schedule
+        (e.g. sensor.petfeeder1_schedule). A change of this entity confirms the
+        publish was accepted by the feeder.
+      selector:
+        entity:
+          domain: sensor
+    window_start:
+      name: Feeding window start
+      description: Time of day the feeding window opens.
+      default: "07:00:00"
+      selector:
+        time: {}
+    window_end:
+      name: Feeding window end
+      description: >-
+        Time of day the feeding window closes. The new schedule is pushed to the
+        device 5 minutes after this time, so today's (already finished) window is
+        never disturbed; the random times take effect from the next day onward.
+      default: "19:00:00"
+      selector:
+        time: {}
+    num_feeds:
+      name: Feeds per day
+      description: How many feedings to schedule each day.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 12
+          step: 1
+          mode: box
+    min_gap:
+      name: Minimum gap (minutes)
+      description: Minimum minutes between two consecutive feeds.
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 720
+          step: 1
+          mode: box
+    max_gap:
+      name: Maximum gap (minutes)
+      description: Maximum minutes between two consecutive feeds. 0 = no upper limit.
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 720
+          step: 1
+          mode: box
+    portion_size:
+      name: Portion size
+      description: Portions dispensed per feeding (the "size" field in the device schedule).
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 255
+          step: 1
+          mode: box
+    test_mode:
+      name: Test mode
+      description: >-
+        When true, the generated schedule is only shown in a persistent
+        notification and nothing is published to the device. Use this to preview
+        the exact JSON payload before going live.
+      default: false
+      selector:
+        boolean: {}
+
+mode: single
+max_exceeded: silent
+
+triggers:
+  # Dynamic trigger: fires once per day, 5 minutes after window_end.
+  # A 1-minute acceptance window absorbs HA evaluation latency; the template
+  # only transitions false->true once, so it fires exactly one time per day.
+  - trigger: template
+    value_template: >-
+      {% set target = today_at(window_end) + timedelta(minutes=5) %}
+      {{ now() >= target and now() < target + timedelta(minutes=1) }}
+
+variables:
+  # Snapshot of the sensor's current state, taken when the automation starts
+  # (i.e. before the new schedule is published). The verification wait below
+  # compares against this to detect a state change on the (dynamic) sensor.
+  pre_publish_state: "{{ states(schedule_sensor) }}"
+  # Random schedule generator with equal-division jitter.
+  #
+  # All feed times are placed strictly inside the window, i.e. in the minute
+  # range [window_start+1, window_end-1].
+  #
+  # Strategy: split the window interior into num_feeds equal periods and place
+  # exactly one feed per period at a random minute. The schedule stays evenly
+  # spread across the day (like the pet's usual rhythm) while remaining
+  # unpredictable from day to day.
+  #
+  # min_gap is enforced by clamping each period's range down to
+  # prev_feed + min_gap; max_gap (when > 0) clamps it up to
+  # prev_feed + max_gap. If those clamps make the period infeasible (only
+  # possible when max_gap is smaller than a period length), the feed spills
+  # into the neighbouring region instead — gap limits always win over strict
+  # period placement.
+  #
+  # All loop-mutating state lives in namespace() objects because HA's Jinja2
+  # does not let a plain variable persist across {% for %} iterations.
+  #
+  # Edge cases:
+  #   window <= 1 min wide -> single feed at window_start (no interior minute)
+  #   num_feeds == 1       -> one random interior minute (period = whole window)
+  #   (n-1)*min_gap > span -> evenly spaced fallback (random infeasible)
+  schedule_payload: >-
+    {%- set ws = window_start.split(':') -%}
+    {%- set we = window_end.split(':') -%}
+    {%- set start_min = (ws[0]|int) * 60 + (ws[1]|int) -%}
+    {%- set end_min = (we[0]|int) * 60 + (we[1]|int) -%}
+    {%- set n = num_feeds | int -%}
+    {%- set g_min = [min_gap|int, 1] | max -%}
+    {%- set g_max = max_gap | int -%}
+    {%- set G = n - 1 -%}
+    {%- set ns = namespace(times=[]) -%}
+    {%- if end_min - start_min <= 1 -%}
+      {# Degenerate window: no strictly-interior minute exists; feed at the start. #}
+      {%- set ns.times = [start_min] -%}
+    {%- elif G * g_min > (end_min - 1) - (start_min + 1) -%}
+      {# Not enough room for the minimum gaps: fall back to even spacing. #}
+      {%- set first_min = start_min + 1 -%}
+      {%- set last_min = end_min - 1 -%}
+      {%- set span = [last_min - first_min, 0] | max -%}
+      {%- for i in range(n) -%}
+        {%- set ns.times = ns.times + [first_min + (i * span) // G] -%}
+      {%- endfor -%}
+    {%- else -%}
+      {# Equal-division jitter: split the interior window into n periods, one feed per period. #}
+      {%- set first_min = start_min + 1 -%}
+      {%- set last_min = end_min - 1 -%}
+      {%- set span = last_min - first_min -%}
+      {%- set gen = namespace(prev=None) -%}
+      {%- for i in range(n) -%}
+        {%- set lo = first_min + (i * span) // n -%}
+        {%- set hi = [first_min + ((i + 1) * span) // n - 1, last_min] | min -%}
+        {%- if gen.prev is none -%}
+          {%- set rlo = lo -%}
+          {%- set rhi = hi -%}
+        {%- else -%}
+          {%- set rlo = [lo, gen.prev + g_min] | max -%}
+          {%- if g_max > 0 -%}
+            {%- set rhi = [hi, gen.prev + g_max] | min -%}
+          {%- else -%}
+            {%- set rhi = hi -%}
+          {%- endif -%}
+        {%- endif -%}
+        {%- if rlo > rhi -%}
+          {# Gap limits conflict with this period (only when max_gap < period length): spill over. #}
+          {%- if gen.prev is none -%}
+            {%- set rlo = first_min -%}
+            {%- set rhi = last_min -%}
+          {%- else -%}
+            {%- set rlo = gen.prev + g_min -%}
+            {%- if g_max > 0 -%}
+              {%- set rhi = [last_min, gen.prev + g_max] | min -%}
+            {%- else -%}
+              {%- set rhi = last_min -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+        {%- set t = range(rlo, rhi + 1) | random -%}
+        {%- set gen.prev = t -%}
+        {%- set ns.times = ns.times + [t] -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- set ens = namespace(entries=[]) -%}
+    {%- for t in ns.times -%}
+      {%- set ens.entries = ens.entries + [{'days': 'everyday', 'hour': (t // 60)|int, 'minute': (t % 60)|int, 'size': portion_size|int}] -%}
+    {%- endfor -%}
+    {{- {'schedule': ens.entries} | tojson -}}
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ test_mode }}"
+    then:
+      # Test mode: preview only, no MQTT traffic.
+      - action: notify.persistent_notification
+        data:
+          title: "Random feeder schedule (TEST MODE)"
+          message: >-
+            Generated schedule for tomorrow (not published to the device):
+            {{ schedule_payload }}
+    else:
+      # Live mode: push to the device's onboard schedule, then verify.
+      - action: mqtt.publish
+        data:
+          topic: "zigbee2mqtt/{{ device_attr(feeder_device, 'name') }}/set"
+          payload: "{{ schedule_payload }}"
+      - wait_for_trigger:
+          # A `state` trigger validates its entity_id at config time and rejects
+          # a templated (dynamic) entity reference, so the wait uses a template
+          # trigger that compares against the pre-publish snapshot instead.
+          - trigger: template
+            value_template: >-
+              {{ states(schedule_sensor) != pre_publish_state }}
+        timeout:
+          seconds: 60
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: notify.persistent_notification
+            data:
+              title: "Feeder schedule update FAILED"
+              message: >-
+                The feeder did not confirm the new schedule within 60 seconds,
+                so it is likely still running on yesterday's schedule. Payload
+                that was published to zigbee2mqtt/{{ device_attr(feeder_device, 'name') }}/set:
+                {{ schedule_payload }}
